@@ -18,13 +18,17 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub proxy: Option<String>,
     /// API 接口类型："openai" | "anthropic" | "gemini" | "ollama"
-    /// 用于前端显示和接口兼容性标识，默认 "openai"
-    #[serde(default = "default_api_type")]
+    /// 用于前端显示和接口兼容性标识，默认 "openai"（序列化时省略默认值）
+    #[serde(default = "default_api_type", skip_serializing_if = "is_default_api_type")]
     pub api_type: String,
 }
 
 fn default_api_type() -> String {
     "openai".to_string()
+}
+
+fn is_default_api_type(t: &str) -> bool {
+    t == "openai"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

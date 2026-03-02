@@ -309,6 +309,44 @@ pub struct EvolutionService {
 }
 
 impl EvolutionService {
+    fn is_in_progress_status(status: &EvolutionStatus) -> bool {
+        matches!(
+            *status.normalize(),
+            EvolutionStatus::Triggered
+                | EvolutionStatus::Generating
+                | EvolutionStatus::Generated
+                | EvolutionStatus::Auditing
+                | EvolutionStatus::AuditPassed
+                | EvolutionStatus::CompilePassed
+                | EvolutionStatus::Observing
+        )
+    }
+
+    fn find_in_progress_record_on_disk(&self, skill_name: &str) -> Option<String> {
+        let records = self.list_all_records().ok()?;
+        records
+            .into_iter()
+            .find(|r| r.skill_name == skill_name && Self::is_in_progress_status(&r.status))
+            .map(|r| r.id)
+    }
+
+    /// Reconcile in-memory `active_evolutions` with disk records and return the
+    /// canonical in-progress evolution_id (if any) for this skill.
+    async fn resolve_in_progress_evolution_id(&self, skill_name: &str) -> Option<String> {
+        let disk_id = self.find_in_progress_record_on_disk(skill_name);
+        let mut active = self.active_evolutions.lock().await;
+        match disk_id {
+            Some(id) => {
+                active.insert(skill_name.to_string(), id.clone());
+                Some(id)
+            }
+            None => {
+                active.remove(skill_name);
+                None
+            }
+        }
+    }
+
     pub fn new(skills_dir: PathBuf, config: EvolutionServiceConfig) -> Self {
         let error_tracker = ErrorTracker::new(
             config.error_threshold,
@@ -370,11 +408,9 @@ impl EvolutionService {
             });
         }
 
-        // 如果该技能已有进行中的进化，不重复触发
-        let already_evolving = {
-            let active = self.active_evolutions.lock().await;
-            active.contains_key(skill_name)
-        };
+        // 以磁盘记录作为主事实来源，避免多实例内存态漂移导致误判。
+        let existing_evolution_id = self.resolve_in_progress_evolution_id(skill_name).await;
+        let already_evolving = existing_evolution_id.is_some();
 
         let track_result = {
             let mut tracker = self.error_tracker.lock().await;
@@ -384,6 +420,7 @@ impl EvolutionService {
         if already_evolving {
             info!(
                 skill = %skill_name,
+                evolution_id = ?existing_evolution_id,
                 error_count = track_result.count,
                 "🧠 [自进化] 技能 `{}` 执行出错 (第{}次)，该技能已在学习改进中",
                 skill_name, track_result.count
@@ -997,6 +1034,12 @@ impl EvolutionService {
         context: EvolutionContext,
     ) -> blockcell_core::Result<String> {
         let skill_name = context.skill_name.clone();
+        if let Some(existing_id) = self.resolve_in_progress_evolution_id(&skill_name).await {
+            return Err(Error::Evolution(format!(
+                "技能 `{}` 已有进行中的进化: {}",
+                skill_name, existing_id
+            )));
+        }
         let evolution_id = self.evolution.trigger_evolution(context).await?;
 
         {
@@ -1197,15 +1240,12 @@ impl EvolutionService {
         skill_name: &str,
         description: &str,
     ) -> Result<String> {
-        // 检查是否已有进行中的进化
-        {
-            let active = self.active_evolutions.lock().await;
-            if let Some(existing_id) = active.get(skill_name) {
-                return Err(Error::Evolution(format!(
-                    "技能 `{}` 已有进行中的进化: {}",
-                    skill_name, existing_id
-                )));
-            }
+        // 以磁盘记录为准检查进行中的进化，避免多实例内存状态不一致。
+        if let Some(existing_id) = self.resolve_in_progress_evolution_id(skill_name).await {
+            return Err(Error::Evolution(format!(
+                "技能 `{}` 已有进行中的进化: {}",
+                skill_name, existing_id
+            )));
         }
 
         let current_version = self.evolution.version_manager()
@@ -1429,6 +1469,42 @@ impl EvolutionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn setup_test_dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let mut root = std::env::temp_dir();
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        root.push(format!(
+            "blockcell_evo_service_{}_{}_{}",
+            tag,
+            std::process::id(),
+            now_ns
+        ));
+        let skills_dir = root.join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("create test skills dir");
+        (root, skills_dir)
+    }
+
+    fn test_context(skill_name: &str) -> EvolutionContext {
+        EvolutionContext {
+            skill_name: skill_name.to_string(),
+            current_version: "0.0.0".to_string(),
+            trigger: TriggerReason::ManualRequest {
+                description: "test evolution".to_string(),
+            },
+            error_stack: None,
+            source_snippet: None,
+            tool_schemas: vec![],
+            timestamp: chrono::Utc::now().timestamp(),
+            skill_type: SkillType::PromptOnly,
+            staged: false,
+            staging_skills_dir: None,
+        }
+    }
 
     #[test]
     fn test_error_tracker_threshold_1_triggers_immediately() {
@@ -1495,5 +1571,70 @@ mod tests {
 
         assert!((stats.error_rate("evo_1") - 1.0 / 3.0).abs() < 0.01);
         assert_eq!(stats.error_rate("evo_unknown"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_manual_evolution_uses_disk_record_to_dedupe() {
+        let (root, skills_dir) = setup_test_dirs("manual_dedupe");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_a"))
+            .await
+            .expect("seed evolution record");
+
+        let err = service
+            .trigger_manual_evolution("skill_a", "retry manual trigger")
+            .await
+            .expect_err("should reject duplicate manual evolution");
+        let msg = format!("{}", err);
+        assert!(msg.contains("已有进行中的进化"));
+        assert!(msg.contains(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_external_evolution_uses_disk_record_to_dedupe() {
+        let (root, skills_dir) = setup_test_dirs("external_dedupe");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_b"))
+            .await
+            .expect("seed evolution record");
+
+        let err = service
+            .trigger_external_evolution(test_context("skill_b"))
+            .await
+            .expect_err("should reject duplicate external evolution");
+        let msg = format!("{}", err);
+        assert!(msg.contains("已有进行中的进化"));
+        assert!(msg.contains(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_report_error_reads_disk_state_when_active_memory_is_empty() {
+        let (root, skills_dir) = setup_test_dirs("report_error_reconcile");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_c"))
+            .await
+            .expect("seed evolution record");
+
+        let report = service
+            .report_error("skill_c", "boom", None, vec![])
+            .await
+            .expect("report error");
+        assert!(report.evolution_in_progress);
+        assert!(report.evolution_triggered.is_none());
+
+        let active = service.active_evolutions().await;
+        assert_eq!(active.get("skill_c"), Some(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

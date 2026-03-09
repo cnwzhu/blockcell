@@ -1198,7 +1198,7 @@ impl Default for Config {
             "kimi".to_string(),
             ProviderConfig {
                 api_key: String::new(),
-                api_base: Some("https://api.moonshot.ai/v1".to_string()),
+                api_base: Some("https://api.moonshot.cn/v1".to_string()),
                 proxy: None,
                 api_type: "openai".to_string(),
             },

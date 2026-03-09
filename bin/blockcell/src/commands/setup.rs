@@ -464,7 +464,7 @@ fn default_api_base_for_provider(provider: &str) -> Option<&'static str> {
         "deepseek" => Some("https://api.deepseek.com/v1"),
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com"),
-        "kimi" => Some("https://api.moonshot.ai/v1"),
+        "kimi" => Some("https://api.moonshot.cn/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4"),
         "minimax" => Some("https://api.minimax.chat/v1"),
